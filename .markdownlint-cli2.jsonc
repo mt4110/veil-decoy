@@ -1,0 +1,12 @@
+{
+  // veil-decoy markdownlint configuration
+  // line-length disabled because Japanese text wrapping is non-trivial
+  "config": {
+    "line-length": false,
+    "no-duplicate-heading": true,
+    "single-h1": true,
+    "no-trailing-spaces": true,
+    "no-multiple-blanks": true
+  },
+  "ignores": ["node_modules", "target", ".wrangler", "crates/**/target"]
+}

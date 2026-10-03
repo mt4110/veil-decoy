@@ -1,0 +1,13 @@
+name = "veil-decoy-edge"
+main = "crates/veil-decoy-edge/src/lib.rs"
+compatibility_date = "2024-04-05"
+
+[build]
+command = "cargo build --target wasm32-unknown-unknown --release -p veil-decoy-edge"
+
+[[kv_namespaces]]
+binding = "VEIL_TOKENS"
+id = ""          # fill in after: wrangler kv:namespace create VEIL_TOKENS
+
+# Secrets (set via: wrangler secret put SLACK_WEBHOOK_URL)
+# SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/..."

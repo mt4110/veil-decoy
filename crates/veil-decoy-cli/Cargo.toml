@@ -1,0 +1,19 @@
+[package]
+name = "veil-decoy-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Honeytoken generator CLI — generate realistic fake credentials and register them with the edge tracker"
+license = "MIT"
+
+[[bin]]
+name = "veil-decoy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+chrono = { version = "0.4", features = ["serde"] }

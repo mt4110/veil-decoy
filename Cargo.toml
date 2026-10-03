@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/veil-decoy-cli",
+    "crates/veil-decoy-edge",
+]
+resolver = "2"
