@@ -1,123 +1,71 @@
 # veil-decoy
 
-**Honeytoken Generator & Tracker** — Intrusion detection through fake credentials
+A CLI and Cloudflare Worker for HTTP honeytokens. Opening a registered URL sends its placement label, source IP, country code, and User-Agent to Slack. Link previews and automated scanners can also trigger alerts. Check the placement and source when investigating an alert.
 
-[![CI](https://github.com/mt4110/veil-decoy/actions/workflows/ci.yml/badge.svg)](https://github.com/mt4110/veil-decoy/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[日本語 README](README.md) · [MIT License](LICENSE)
 
-> 🇯🇵 [日本語 README](README.md)
+## Setup
 
----
+Use Rust 1.100.0, Node.js 26.13.1 LTS, and OSV-Scanner 2.7.1. With mise, review the repository configuration and run `mise trust` and `mise install`. Make Rustup, Wrangler, and OSV-Scanner available on your shell PATH.
 
-## Concept
-
-Instead of raising walls, **catch attackers the moment they step inside**.
-
-`veil-decoy` generates realistic-looking fake API keys and connection strings (honeytokens).  
-The moment an attacker attempts to use one, it captures their IP, country, and User-Agent  
-and sends an instant Slack alert.
-
-```
-🚨 [Veil Decoy Alert] Honeytoken triggered!
-• Trap   : production-db-trap
-• Token  : a3f2...
-• IP     : 198.51.100.x (RU)
-• UA     : python-requests/2.31.0
-⚡ Initiate incident response immediately.
+```sh
+git config --local core.hooksPath .githooks
+cargo install --locked --path crates/veil-decoy-cli
+cargo install --locked --version 0.2.130 wasm-bindgen-cli
 ```
 
----
+Confirm that `wasm-bindgen --version` reports `0.2.130` before building the Worker.
 
-## Why it works
+The pre-commit hook validates the staged workspace with `cargo metadata --locked` and scans `Cargo.lock` and the lab's `package-lock.json`. A Cargo lockfile mismatch, a finding, or a scanner failure blocks the commit. After fixing dependencies, stage the manifests and updated lockfiles. To enforce this check on GitHub, require `Cargo dependency policy` on `main`.
 
-| Traditional detection | veil-decoy |
-|---|---|
-| Predict attack vs. normal → high false-positive rate | Token triggered = 100% confirmed breach |
-| Hard to pinpoint the leak source | Instantly know which repo / file was compromised |
-| Attacker moves with confidence | "Is this a trap?" paranoia slows them down |
+## Deploy
 
----
-
-## Architecture
-
-```
-┌─────────────────────┐       POST /register        ┌─────────────────────────┐
-│   veil-decoy (CLI)  │ ─────────────────────────→  │  veil-decoy-edge        │
-│   Rust binary       │                              │  Cloudflare Workers     │
-└─────────────────────┘                              └────────────┬────────────┘
-         │                                                        │
-    generates                                             attacker hits
-  honeytoken string                                     GET /ping/<token_id>
-         │                                                        │
-    embedded in                                          ┌────────▼────────┐
-  .env / wiki / code                                     │  Slack Webhook  │
-                                                         └─────────────────┘
+```sh
+wrangler login
+wrangler kv namespace create VEIL_TOKENS
+wrangler d1 create veil-decoy-events
 ```
 
----
+Set the KV and D1 IDs in `wrangler.toml`. If the rate-limit `namespace_id` values are already in use in your Cloudflare account, choose unique values. Generate and securely store a random 64-character hexadecimal admin token, for example with `openssl rand -hex 32`.
 
-## Quickstart
-
-### 1. Install
-
-```bash
-git clone https://github.com/mt4110/veil-decoy.git
-cd veil-decoy
-cargo build --release -p veil-decoy-cli
+```sh
+wrangler d1 migrations apply veil-decoy-events --remote
+wrangler deploy
+wrangler secret put VEIL_ADMIN_TOKEN
+wrangler secret put SLACK_WEBHOOK_URL
 ```
 
-### 2. Generate a trap
+Set `VEIL_ADMIN_TOKEN` in the CLI environment. Store `SLACK_WEBHOOK_URL` in the Worker. Upgrading an existing Worker also requires the admin token for registration, listing, and revocation.
 
-```bash
-veil-decoy generate aws --name "production-s3-trap"
-veil-decoy generate redis --name "cache-server-trap"
-veil-decoy generate api --name "internal-api-trap"
+## Register, verify, and revoke a honeytoken
+
+```sh
+export VEIL_EDGE_URL=https://veil-decoy-edge.example.com
+
+trap_url=$(veil-decoy generate http --name "wiki-prod-access")
+curl --silent --output /dev/null --write-out "%{http_code}\n" "$trap_url"
+veil-decoy list
+veil-decoy events <token-id>
+# Use the ID from the list when taking down the token.
+veil-decoy revoke <token-id>
 ```
 
-### 3. Deploy the Cloudflare Workers edge
+The CLI prints the URL after successful registration. The URL returns HTTP `404` even when it triggers an alert. Open a test URL and verify Slack receives the alert before placing a honeytoken. See the [wiki example](examples/wiki-setup.md) for a sample placement.
 
-```bash
-npx wrangler login
-npx wrangler kv:namespace create VEIL_TOKENS   # paste the ID into wrangler.toml
-npx wrangler secret put SLACK_WEBHOOK_URL
-npx wrangler deploy
-```
+Unknown and revoked IDs do not trigger alerts. KV propagation can delay registration and revocation at other locations. Approximate limits apply per Cloudflare location. Up to 30 requests per minute per source proceed to lookup and up to three per registered token proceed to delivery. Suppressed notifications after a match appear as `rate_limited` events.
 
-### 4. Register and monitor
+The Worker records matches in D1 before notifying Slack. It retries timeouts, HTTP 429, and 5xx responses up to six total attempts. `events` returns up to 50 recent records per token with the event ID, detection time as Unix milliseconds, delivery state, attempt count, and last error. Event records expire after seven days. D1 keeps the alert body while delivery is pending. An interruption after Slack accepts the message can cause another delivery with the same event ID.
 
-```bash
-export VEIL_EDGE_URL=https://veil-decoy-edge.<your-account>.workers.dev
+## V2 isolated trial
 
-veil-decoy generate aws --name "project-x-trap" --edge-url $VEIL_EDGE_URL
-# => ✅ Registered with edge server — monitoring active.
-```
+The [lab procedure](lab/v2/README.md) runs the Worker with a local mock and optionally correlates its output with Warden in an ARM64 Linux VM.
 
-Embed the output string in `.env.backup`, an internal wiki, or a stale config file.  
-When an attacker uses it, you'll know immediately.
+## Offline credential decoys
 
----
+`generate aws|redis|api|postgres|slack --name <label>` produces synthetic credentials locally. These formats provide offline decoys without alert delivery. Redis and PostgreSQL placeholders use the reserved `.invalid` domain.
 
-## Supported token types
+Existing `/ping/<token_id>` links still work, and previous KV records can be listed or revoked. New records store the placement label, type, timestamp, and ID.
 
-| kind | Impersonates | Example |
-|---|---|---|
-| `aws` | AWS IAM key pair | `AKIAIOSFODNN7EXAMPLE` |
-| `redis` | Redis connection URL | `redis://admin:xxx@trap…:6379` |
-| `api` | Generic Bearer token | `veil_xxxx…` |
-| `postgres` | PostgreSQL DSN | `postgresql://postgres:xxx@trap…` |
-| `slack` | Slack Bot Token | `xoxb-xxx-xxx-xxx` |
+## Related projects
 
----
-
-## The veil ecosystem
-
-| Repo | Role |
-|---|---|
-| **veil-decoy** (this repo) | 🪤 Lure and expose intruders |
-| [veil-warden](https://github.com/mt4110/veil-warden) | 🛡️ eBPF-based outbound traffic monitor |
-
----
-
-## License
-
-[MIT](LICENSE)
+[veil-warden](https://github.com/mt4110/veil-warden) monitors outbound traffic with eBPF.

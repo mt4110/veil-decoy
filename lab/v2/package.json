@@ -1,0 +1,14 @@
+{
+  "name": "veil-decoy-v2-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node trial.mjs"
+  },
+  "engines": {
+    "node": ">=26.13.1 <27"
+  },
+  "dependencies": {
+    "miniflare": "5.20261123.0-beta"
+  }
+}

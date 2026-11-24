@@ -1,9 +1,11 @@
 /target/
 **/*.rs.bk
-Cargo.lock
+/crates/veil-decoy-edge/build/
 node_modules/
 .wrangler/
 .env
 .env.*
 !.env.example
+.dev.vars
+.dev.vars.*
 .DS_Store

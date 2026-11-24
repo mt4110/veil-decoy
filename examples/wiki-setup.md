@@ -1,32 +1,15 @@
-# 旧検証環境のセットアップメモ（2024-03 廃止予定）
+# 社内 Wiki への配置例
 
-> **注意**: 以下の接続情報は旧ステージング環境のものです。現在は使用されていません。
+自分が管理する Wiki に置く HTTP ハニートークンの例です。ページやファイルを特定できるよう、配置ごとにラベルを変えます。
 
-## Redis（旧キャッシュ層）
-
-```
-redis://admin:REPLACE_WITH_GENERATED@trap.veil-edge.workers.dev:6379/0
+```sh
+veil-decoy generate http --name "wiki/legacy-staging/access"
 ```
 
-## 社内 Kubernetes クラスター
+ページ内のリンクを、CLI が出力した URL に差し替えます。
 
-```yaml
-# kubeconfig excerpt
-clusters:
-  - cluster:
-      server: https://trap.veil-edge.workers.dev/k8s
-    name: internal-staging
+```markdown
+旧ステージングの管理画面は [こちら](https://veil-decoy-edge.example.com/ping/REPLACE_WITH_TOKEN_ID)。
 ```
 
-## AWS（旧バッチ処理用）
-
-```bash
-export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-export AWS_DEFAULT_REGION=ap-northeast-1
-```
-
----
-
-*このページは社内Wikiの片隅に置いておく「仕掛け見本」です。
-実際のトークンは `veil-decoy generate` で生成して差し替えてください。*
+Wiki がリンクをプレビューする場合、ページを保存した時点で通知が来ることがあります。配置前のテストには別のトークンを使い、撤去時は `veil-decoy list` から対象 ID を確認して `veil-decoy revoke <token-id>` を実行します。
