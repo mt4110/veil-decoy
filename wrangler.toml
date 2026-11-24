@@ -1,13 +1,40 @@
 name = "veil-decoy-edge"
-main = "crates/veil-decoy-edge/src/lib.rs"
-compatibility_date = "2024-04-05"
+main = "crates/veil-decoy-edge/worker.js"
+compatibility_date = "2026-11-23"
 
 [build]
-command = "cargo build --target wasm32-unknown-unknown --release -p veil-decoy-edge"
+command = """
+cargo build --locked --release --target wasm32-unknown-unknown --package veil-decoy-edge --target-dir target &&
+wasm-bindgen --target web --no-typescript --out-dir crates/veil-decoy-edge/build target/wasm32-unknown-unknown/release/veil_decoy_edge.wasm
+"""
+watch_dir = "crates/veil-decoy-edge/src"
+
+[observability]
+enabled = true
+
+[observability.logs]
+invocation_logs = false
 
 [[kv_namespaces]]
 binding = "VEIL_TOKENS"
-id = ""          # fill in after: wrangler kv:namespace create VEIL_TOKENS
+id = ""          # Fill in after: wrangler kv namespace create VEIL_TOKENS
 
-# Secrets (set via: wrangler secret put SLACK_WEBHOOK_URL)
-# SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/..."
+[[d1_databases]]
+binding = "VEIL_EVENTS"
+database_name = "veil-decoy-events"
+database_id = "" # Fill in after: wrangler d1 create veil-decoy-events
+
+[triggers]
+crons = ["* * * * *"]
+
+[[ratelimits]]
+name = "VEIL_ALERT_LIMIT"
+namespace_id = "1001" # Use an identifier unique to this binding in your Cloudflare account.
+simple = { limit = 3, period = 60 }
+
+[[ratelimits]]
+name = "VEIL_REQUEST_LIMIT"
+namespace_id = "1002"
+simple = { limit = 30, period = 60 }
+
+# Secrets: VEIL_ADMIN_TOKEN, SLACK_WEBHOOK_URL

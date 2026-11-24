@@ -3,4 +3,11 @@ members = [
     "crates/veil-decoy-cli",
     "crates/veil-decoy-edge",
 ]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+
+[profile.release.package.veil-decoy-edge]
+opt-level = "s"

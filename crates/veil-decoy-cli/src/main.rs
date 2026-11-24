@@ -1,176 +1,288 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::Rng;
+use rand::RngExt;
+use reqwest::{StatusCode, Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use std::{env, error::Error, process::ExitCode, time::Duration};
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// CLI definition
-// ---------------------------------------------------------------------------
+type CliResult<T> = Result<T, Box<dyn Error>>;
 
-/// veil-decoy — Honeytoken generator & tracker
-///
-/// Generate realistic-looking fake credentials and register them with the
-/// Veil edge server so you get an instant Slack alert the moment an attacker
-/// tries to use them.
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
+#[command(
+    version,
+    about = "Generate decoy credentials and manage HTTP honeytokens"
+)]
 struct Cli {
+    /// Base URL of the Veil Worker
+    #[arg(short, long, global = true, env = "VEIL_EDGE_URL")]
+    edge_url: Option<Url>,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Generate a new honeytoken
+enum Command {
+    /// Generate a new decoy or register an HTTP honeytoken
     Generate {
-        /// Type of credential to spoof
         #[arg(value_enum)]
         kind: TokenKind,
-
-        /// Human-readable label for this trap (used in alert messages)
+        /// Label used to identify the placement
         #[arg(short, long)]
         name: String,
-
-        /// Veil edge endpoint to register the token with (optional)
-        #[arg(short, long, env = "VEIL_EDGE_URL")]
-        edge_url: Option<String>,
     },
-
-    /// List all tokens registered with the edge (requires VEIL_EDGE_URL)
-    List {
-        #[arg(short, long, env = "VEIL_EDGE_URL")]
-        edge_url: String,
-    },
+    /// List registered tokens
+    List,
+    /// Show recent detection and delivery states for a token
+    Events { id: Uuid },
+    /// Revoke a registered token by ID
+    Revoke { id: Uuid },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 enum TokenKind {
-    /// AWS access key pair (AKIA…)
+    /// Monitored HTTP link
+    Http,
+    /// AWS-shaped access key pair (offline)
     Aws,
-    /// Redis connection string
+    /// Redis connection string (offline)
     Redis,
-    /// Generic API key / Bearer token
+    /// Generic API key (offline)
     Api,
-    /// PostgreSQL DSN
+    /// PostgreSQL connection string (offline)
     Postgres,
-    /// Slack bot token
+    /// Slack-shaped bot token (offline)
     Slack,
 }
 
-// ---------------------------------------------------------------------------
-// Token generation
-// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+struct Registration<'a> {
+    id: Uuid,
+    name: &'a str,
+}
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Honeytoken {
-    id: String,
+#[derive(Deserialize)]
+struct TokenRecord {
+    id: Uuid,
     name: String,
     kind: String,
-    value: String,
     created_at: String,
 }
 
-fn generate_token(kind: TokenKind, name: &str) -> Honeytoken {
-    let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let value = match kind {
-        TokenKind::Aws => generate_aws_keypair(),
-        TokenKind::Redis => generate_redis_url(),
-        TokenKind::Api => generate_api_key(),
-        TokenKind::Postgres => generate_postgres_dsn(),
-        TokenKind::Slack => generate_slack_token(),
-    };
-    Honeytoken {
-        id,
-        name: name.to_string(),
-        kind: format!("{:?}", kind).to_lowercase(),
-        value,
-        created_at: now,
+#[derive(Deserialize)]
+struct TokenPage {
+    tokens: Vec<TokenRecord>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EventRecord {
+    id: Uuid,
+    observed_at: i64,
+    state: String,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
+struct EdgeClient {
+    base_url: Url,
+    client: Client,
+    admin_token: String,
+}
+
+impl EdgeClient {
+    fn new(base_url: Option<Url>) -> CliResult<Self> {
+        let base_url = base_url.ok_or("Set VEIL_EDGE_URL or pass --edge-url.")?;
+        let local = matches!(
+            base_url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]")
+        );
+        let safe_scheme = base_url.scheme() == "https" || (local && base_url.scheme() == "http");
+        if !safe_scheme
+            || !base_url.username().is_empty()
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err("Use an HTTPS edge URL without credentials, a query, or a fragment (HTTP is allowed for local development).".into());
+        }
+
+        let admin_token = env::var("VEIL_ADMIN_TOKEN").map_err(|_| "Set VEIL_ADMIN_TOKEN.")?;
+        if admin_token.len() != 64 || !admin_token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("VEIL_ADMIN_TOKEN must contain 64 hexadecimal characters.".into());
+        }
+
+        let mut builder = Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(10));
+        if local {
+            builder = builder.no_proxy();
+        }
+
+        Ok(Self {
+            base_url,
+            client: builder.build()?,
+            admin_token,
+        })
+    }
+
+    fn endpoint(&self, parts: &[&str]) -> Url {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .expect("validated HTTP(S) URL")
+            .pop_if_empty()
+            .extend(parts);
+        url
+    }
+
+    fn register(&self, name: &str) -> CliResult<Url> {
+        let id = Uuid::new_v4();
+        let response = self
+            .client
+            .post(self.endpoint(&["register"]))
+            .bearer_auth(&self.admin_token)
+            .json(&Registration { id, name })
+            .send()?;
+        require_status(response.status(), StatusCode::CREATED)?;
+        Ok(self.endpoint(&["ping", &id.to_string()]))
+    }
+
+    fn list(&self) -> CliResult<()> {
+        let mut url = self.endpoint(&["tokens"]);
+        loop {
+            let response = self
+                .client
+                .get(url.clone())
+                .bearer_auth(&self.admin_token)
+                .send()?;
+            require_status(response.status(), StatusCode::OK)?;
+            let page: TokenPage = response.json()?;
+
+            for token in page.tokens {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    token.id,
+                    single_line(&token.kind),
+                    single_line(&token.created_at),
+                    single_line(&token.name),
+                );
+            }
+
+            let Some(cursor) = page.cursor else {
+                return Ok(());
+            };
+            url.set_query(None);
+            url.query_pairs_mut().append_pair("cursor", &cursor);
+        }
+    }
+
+    fn revoke(&self, id: Uuid) -> CliResult<()> {
+        let response = self
+            .client
+            .delete(self.endpoint(&["tokens", &id.to_string()]))
+            .bearer_auth(&self.admin_token)
+            .send()?;
+        require_status(response.status(), StatusCode::NO_CONTENT)
+    }
+
+    fn events(&self, id: Uuid) -> CliResult<()> {
+        let mut url = self.endpoint(&["events"]);
+        url.query_pairs_mut()
+            .append_pair("token_id", &id.to_string());
+        let response = self.client.get(url).bearer_auth(&self.admin_token).send()?;
+        require_status(response.status(), StatusCode::OK)?;
+        for event in response.json::<Vec<EventRecord>>()? {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                event.id,
+                event.observed_at,
+                single_line(&event.state),
+                event.attempts,
+                single_line(event.last_error.as_deref().unwrap_or("-")),
+            );
+        }
+        Ok(())
     }
 }
 
-fn random_alphanum(len: usize) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+fn require_status(actual: StatusCode, expected: StatusCode) -> CliResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("Edge API returned HTTP {actual}.").into())
+    }
+}
+
+fn single_line(value: &str) -> String {
+    value.replace(char::is_control, " ")
+}
+
+fn random_chars(len: usize, alphabet: &[u8]) -> String {
+    let mut rng = rand::rng();
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| alphabet[rng.random_range(0..alphabet.len())] as char)
         .collect()
 }
 
-fn generate_aws_keypair() -> String {
-    // Real AWS keys: AKIA[A-Z0-9]{16}  (20 chars total)
-    let key_id = format!("AKIA{}", random_alphanum(16).to_uppercase());
-    let secret = random_alphanum(40);
-    format!(
-        "AWS_ACCESS_KEY_ID={key_id}\nAWS_SECRET_ACCESS_KEY={secret}"
-    )
+fn offline_decoy(kind: TokenKind) -> String {
+    const ALPHANUMERIC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const UPPERCASE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const LOWERCASE: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+    match kind {
+        TokenKind::Aws => format!(
+            "AWS_ACCESS_KEY_ID=AKIA{}\nAWS_SECRET_ACCESS_KEY={}",
+            random_chars(16, UPPERCASE),
+            random_chars(40, ALPHANUMERIC)
+        ),
+        TokenKind::Redis => format!(
+            "redis://admin:{}@cache.example.invalid:6379/0",
+            random_chars(24, ALPHANUMERIC)
+        ),
+        TokenKind::Api => format!("veil_{}", random_chars(40, LOWERCASE)),
+        TokenKind::Postgres => format!(
+            "postgresql://postgres:{}@db.example.invalid:5432/production",
+            random_chars(24, ALPHANUMERIC)
+        ),
+        TokenKind::Slack => format!(
+            "xoxb-{}-{}-{}",
+            random_chars(10, ALPHANUMERIC),
+            random_chars(10, ALPHANUMERIC),
+            random_chars(24, ALPHANUMERIC)
+        ),
+        TokenKind::Http => unreachable!("HTTP honeytokens are registered with the Worker"),
+    }
 }
 
-fn generate_redis_url() -> String {
-    let pass = random_alphanum(24);
-    // Points to the Veil edge; placeholder replaced at registration time
-    format!("redis://admin:{pass}@trap.veil-edge.workers.dev:6379/0")
-}
-
-fn generate_api_key() -> String {
-    format!("veil_{}", random_alphanum(40).to_lowercase())
-}
-
-fn generate_postgres_dsn() -> String {
-    let pass = random_alphanum(24);
-    format!("postgresql://postgres:{pass}@trap.veil-edge.workers.dev:5432/production")
-}
-
-fn generate_slack_token() -> String {
-    format!("xoxb-{}-{}-{}", random_alphanum(10), random_alphanum(10), random_alphanum(24))
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-fn main() {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> CliResult<()> {
     match cli.command {
-        Commands::Generate { kind, name, edge_url } => {
-            let token = generate_token(kind, &name);
-
-            println!("\n🎯  Honeytoken generated\n");
-            println!("  ID      : {}", token.id);
-            println!("  Name    : {}", token.name);
-            println!("  Kind    : {}", token.kind);
-            println!("  Created : {}", token.created_at);
-            println!("\n━━━  Embed the following into your target file  ━━━\n");
-            println!("{}", token.value);
-            println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-
-            if let Some(url) = edge_url {
-                match register_with_edge(&url, &token) {
-                    Ok(_) => println!("✅  Registered with edge server — monitoring active."),
-                    Err(e) => eprintln!("⚠️   Edge registration failed: {e}"),
-                }
-            } else {
-                println!("💡  Tip: set VEIL_EDGE_URL to auto-register with the edge tracker.");
-            }
+        Command::Generate {
+            kind: TokenKind::Http,
+            name,
+        } => {
+            println!("{}", EdgeClient::new(cli.edge_url)?.register(&name)?);
         }
-
-        Commands::List { edge_url } => {
-            println!("📋  Fetching registered tokens from {edge_url} …");
-            // TODO: implement GET /tokens once edge API is live
-            println!("(not yet implemented — coming in v0.2)");
+        Command::Generate { kind, name } => {
+            eprintln!(
+                "Offline decoy: {}. This credential does not send alerts.",
+                single_line(&name)
+            );
+            println!("{}", offline_decoy(kind));
+        }
+        Command::List => EdgeClient::new(cli.edge_url)?.list()?,
+        Command::Events { id } => EdgeClient::new(cli.edge_url)?.events(id)?,
+        Command::Revoke { id } => {
+            EdgeClient::new(cli.edge_url)?.revoke(id)?;
+            println!("Revoked {id}.");
         }
     }
+    Ok(())
 }
 
-fn register_with_edge(base_url: &str, token: &Honeytoken) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/register", base_url.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::new();
-    let res = client.post(&url).json(token).send()?;
-    if res.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP {}", res.status()).into())
+fn main() -> ExitCode {
+    if let Err(error) = run(Cli::parse()) {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
