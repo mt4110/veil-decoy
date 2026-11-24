@@ -1,0 +1,39 @@
+name: Dependency policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-policy:
+    name: Cargo dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load the pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install the pinned OSV-Scanner
+        shell: bash
+        run: |
+          scanner="$RUNNER_TEMP/osv-scanner"
+          curl --fail --silent --show-error --location \
+            https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64 \
+            --output "$scanner"
+          printf '%s  %s\n' \
+            fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8 \
+            "$scanner" | sha256sum --check -
+          chmod +x "$scanner"
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Validate and scan the committed dependencies
+        run: .githooks/pre-commit
